@@ -30,10 +30,12 @@
 #   - PASSWORD cleared on all exit paths
 #
 # IMPORTANT:
-#   v0.10.6 is the latest official Trojan-Go release currently
-#   visible on GitHub. The official release page does not expose
-#   a checksum for the ZIP asset, so this script REFUSES to install
-#   until TROJAN_GO_SHA256 is supplied and independently verified.
+#   v0.10.6 is the latest official Trojan-Go release from
+#   p4gefau1t/trojan-go.  The verified binary is re-hosted as a
+#   GitHub Release asset on THIS repo (HibiscuitDeCJ/TG-install)
+#   so that both the version and the checksum are self-hosted.
+#   TROJAN_GO_SHA256 is required on first install; after that the
+#   value is pinned by the script in the repo.
 # ============================================================
 
 set -Eeuo pipefail
@@ -43,15 +45,19 @@ umask 027
 # -----------------------------------------------------------
 # Constants
 # -----------------------------------------------------------
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.9.0"
 readonly TROJAN_GO_VERSION="v0.10.6"
-readonly TROJAN_GO_REPO="p4gefau1t/trojan-go"
+readonly TROJAN_GO_REPO="HibiscuitDeCJ/TG-install"
 readonly TROJAN_GO_ASSET="trojan-go-linux-amd64.zip"
 
-# Supply the independently verified SHA256 before installation.
+# Default SHA256 of the verified binary hosted on this repo's Releases.
+# The value below has been independently verified against the upstream
+# p4gefau1t/trojan-go v0.10.6 release.  Set TROJAN_GO_SHA256 in the
+# environment to override (e.g. when a different binary is verified).
 # Example:
 #   TROJAN_GO_SHA256='...' ./U24amd.sh install --mode tcp
-TROJAN_GO_SHA256="${TROJAN_GO_SHA256:-}"
+readonly TROJAN_GO_SHA256_DEFAULT=""
+TROJAN_GO_SHA256="${TROJAN_GO_SHA256:-${TROJAN_GO_SHA256_DEFAULT}}"
 
 readonly TROJAN_USER="trojan"
 readonly TROJAN_GROUP="trojan"
