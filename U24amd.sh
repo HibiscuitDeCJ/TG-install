@@ -1385,10 +1385,10 @@ run_audit() {
     echo "7. Network Audit"
     echo "----------------------"
 
-    # 443
-    if ss -lntp 2>/dev/null | grep -Eq '0\.0\.0\.0:443[[:space:]]'; then
+    # 443 — check all common bind address formats (0.0.0.0, *, [::])
+    if ss -lntp 2>/dev/null | grep -Eq '(0\.0\.0\.0|\*|\[::\]):443[[:space:]]'; then
         local proc_443
-        proc_443="$(ss -lntp 2>/dev/null | grep -E '0\.0\.0\.0:443[[:space:]]' | awk '{print $NF}' | head -1)"
+        proc_443="$(ss -lntp 2>/dev/null | grep -E '(0\.0\.0\.0|\*|\[::\]):443[[:space:]]' | awk '{print $NF}' | head -1)"
         audit_item PASS "443 listening  : yes (${proc_443})"
     elif ss -lntp 2>/dev/null | grep -Eq ':443[[:space:]]'; then
         local proc_443
@@ -1417,21 +1417,21 @@ run_audit() {
     if command -v ufw >/dev/null 2>&1; then
         if ufw status 2>/dev/null | grep -q 'Status: active'; then
             audit_item PASS "UFW            : active"
-        else
-            audit_item WARN "UFW            : inactive"
-        fi
 
-        # Check no 8080/8081 exposed
-        if ufw status 2>/dev/null | grep -qE '8080|8081'; then
-            audit_item FAIL "UFW 8080/8081  : exposed in firewall — should be internal only!"
-        else
-            audit_item PASS "UFW 8080/8081  : not exposed"
-        fi
+            # Check no 8080/8081 exposed
+            if ufw status 2>/dev/null | grep -qE '8080|8081'; then
+                audit_item FAIL "UFW 8080/8081  : exposed in firewall — should be internal only!"
+            else
+                audit_item PASS "UFW 8080/8081  : not exposed"
+            fi
 
-        if ufw status 2>/dev/null | grep -qE '443'; then
-            audit_item PASS "UFW 443        : allowed"
+            if ufw status 2>/dev/null | grep -qE '443'; then
+                audit_item PASS "UFW 443        : allowed"
+            else
+                audit_item FAIL "UFW 443        : NOT allowed"
+            fi
         else
-            audit_item FAIL "UFW 443        : NOT allowed"
+            audit_item WARN "UFW            : inactive (no firewall, all ports open)"
         fi
     else
         audit_item WARN "UFW            : not installed"
