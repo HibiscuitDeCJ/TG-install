@@ -90,9 +90,14 @@ LOG_FILE="/var/log/trojan-go-installer.log"
 
 log() {
     local level="$1"; shift
-    printf '[%s] [%s] %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" \
-        | tee -a "$LOG_FILE"
+    local msg
+    msg="$(printf '[%s] [%s] %s' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*")"
+    echo "$msg"
+    # Best-effort append to log file; never fail on logging
+    if [[ -d "$(dirname "$LOG_FILE")" ]]; then
+        echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+    fi
 }
 info()  { log INFO  "$@"; }
 warn()  { log WARN  "$@"; }
@@ -109,6 +114,8 @@ trap cleanup EXIT
 
 on_error() {
     local rc=$? line="$1"
+    # Prevent recursive trap during error handling
+    trap - ERR
     error "Failure at line ${line}, exit code ${rc}."
     exit "$rc"
 }
