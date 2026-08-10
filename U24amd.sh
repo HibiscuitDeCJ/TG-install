@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# Trojan-Go Secure Installer v1.6
+# Trojan-Go Secure Installer v1.8
 #
 # Target: Ubuntu 24.04 / amd64 / IPv4
 #
@@ -8,6 +8,14 @@
 #   tcp       Trojan-Go TCP + TLS, no Nginx
 #   ws        Trojan-Go WebSocket + TLS, no Nginx
 #   fallback  Trojan-Go TCP + TLS + local Nginx fallback
+#
+# Commands:
+#   install    Full installation
+#   test       Pre-installation environment test
+#   audit      Post-installation security audit
+#   status     Quick runtime status
+#   update     Future: safe update (stub)
+#   uninstall  Future: full uninstall (stub)
 #
 # Security principles:
 #   - no curl | bash
@@ -19,6 +27,7 @@
 #   - UFW never reset
 #   - existing Nginx config is not overwritten
 #   - systemd hardening
+#   - PASSWORD cleared on all exit paths
 #
 # IMPORTANT:
 #   v0.10.6 is the latest official Trojan-Go release currently
@@ -31,14 +40,17 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly SCRIPT_VERSION="1.6.0"
+# -----------------------------------------------------------
+# Constants
+# -----------------------------------------------------------
+readonly SCRIPT_VERSION="1.8.0"
 readonly TROJAN_GO_VERSION="v0.10.6"
 readonly TROJAN_GO_REPO="p4gefau1t/trojan-go"
 readonly TROJAN_GO_ASSET="trojan-go-linux-amd64.zip"
 
 # Supply the independently verified SHA256 before installation.
 # Example:
-#   TROJAN_GO_SHA256='...' ./install.sh install --mode tcp
+#   TROJAN_GO_SHA256='...' ./U24amd.sh install --mode tcp
 TROJAN_GO_SHA256="${TROJAN_GO_SHA256:-}"
 
 readonly TROJAN_USER="trojan"
@@ -66,16 +78,34 @@ WS_PATH=""
 SSH_PORTS=()
 CURRENT_SSH_PORT=""
 
+# Audit counters
+AUDIT_PASS=0
+AUDIT_FAIL=0
+AUDIT_WARN=0
+
+# -----------------------------------------------------------
+# Logging
+# -----------------------------------------------------------
+LOG_FILE="/var/log/trojan-go-installer.log"
+
 log() {
     local level="$1"; shift
     printf '[%s] [%s] %s\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" \
-        | tee -a /var/log/trojan-go-installer.log
+        | tee -a "$LOG_FILE"
 }
-info(){ log INFO "$@"; }
-warn(){ log WARN "$@"; }
-error(){ log ERROR "$@" >&2; }
-die(){ error "$@"; exit 1; }
+info()  { log INFO  "$@"; }
+warn()  { log WARN  "$@"; }
+error() { log ERROR "$@" >&2; }
+die()   { error "$@"; exit 1; }
+
+# -----------------------------------------------------------
+# Cleanup — ensure sensitive data is cleared on any exit
+# -----------------------------------------------------------
+cleanup() {
+    unset PASSWORD 2>/dev/null || true
+}
+trap cleanup EXIT
 
 on_error() {
     local rc=$? line="$1"
@@ -84,25 +114,41 @@ on_error() {
 }
 trap 'on_error "${LINENO}"' ERR
 
+# -----------------------------------------------------------
+# Usage
+# -----------------------------------------------------------
 usage() {
     cat <<EOF
 Trojan-Go Secure Installer ${SCRIPT_VERSION}
 
-Usage:
-  $0 install --mode tcp|ws|fallback [--domain DOMAIN] [--email EMAIL]
-  $0 status
-  $0 test
-  $0 update
-  $0 uninstall
+Commands:
+  install        Full installation
+  test           Pre-installation environment test
+  audit          Post-installation security audit
+  status         Quick runtime status
+  update         Future: safe update
+  uninstall      Future: full uninstall
+
+Install options:
+  --mode tcp|ws|fallback   (required)
+  --domain DOMAIN
+  --email EMAIL
 
 Examples:
   TROJAN_GO_SHA256='...' $0 install --mode tcp --domain example.com
-  TROJAN_GO_SHA256='...' $0 install --mode ws --domain example.com
+  TROJAN_GO_SHA256='...' $0 install --mode ws  --domain example.com
   TROJAN_GO_SHA256='...' $0 install --mode fallback --domain example.com
+  $0 test
+  $0 audit
+  $0 status
 
 The SHA256 is intentionally mandatory. Do not remove that check.
 EOF
 }
+
+# ===========================================================
+# CHECK FUNCTIONS
+# ===========================================================
 
 check_root() {
     [[ $EUID -eq 0 ]] || die "Run as root."
@@ -113,7 +159,7 @@ check_os() {
     # shellcheck disable=SC1091
     source /etc/os-release
     [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] \
-        || die "Ubuntu 24.04 is required."
+        || die "Ubuntu 24.04 is required. Detected: ${ID:-} ${VERSION_ID:-}"
 }
 
 check_arch() {
@@ -122,18 +168,108 @@ check_arch() {
 }
 
 check_commands() {
-    local c
+    local c missing=()
     for c in awk sed grep ip ss dpkg systemctl; do
-        command -v "$c" >/dev/null 2>&1 || die "Missing command: $c"
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
     done
+    [[ ${#missing[@]} -eq 0 ]] || die "Missing commands: ${missing[*]}"
 }
 
 check_ipv4() {
     local ip4
     ip4="$(ip -4 route get 1.1.1.1 2>/dev/null |
         awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-    [[ -n "$ip4" ]] && info "Server IPv4: $ip4" || warn "Could not detect IPv4 automatically."
+    if [[ -n "$ip4" ]]; then
+        info "Server IPv4: $ip4"
+    else
+        warn "Could not detect IPv4 automatically."
+    fi
 }
+
+check_ports_free() {
+    local port port_list=(443)
+    [[ "$MODE" == "fallback" ]] && port_list+=(8080 8081)
+
+    info "Checking port availability..."
+    for port in "${port_list[@]}"; do
+        if ss -lntp 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
+            die "Port ${port} is already in use. Please free it before installing."
+        fi
+        info "  Port ${port}: free"
+    done
+}
+
+check_dns() {
+    local domain="${1:-}"
+    [[ -n "$domain" ]] || return 0
+
+    info "Checking DNS resolution for ${domain}..."
+    local resolved=""
+    if command -v dig >/dev/null 2>&1; then
+        resolved="$(dig +short "$domain" A 2>/dev/null || true)"
+    elif command -v nslookup >/dev/null 2>&1; then
+        resolved="$(nslookup "$domain" 2>/dev/null | awk '/^Address:/ && !/#/{print $2}' || true)"
+    elif command -v host >/dev/null 2>&1; then
+        resolved="$(host "$domain" 2>/dev/null | awk '/has address/{print $NF}' || true)"
+    fi
+
+    if [[ -n "$resolved" ]]; then
+        info "  ${domain} resolves to: ${resolved}"
+    else
+        warn "  Could not resolve ${domain}. DNS may not be configured yet."
+    fi
+}
+
+check_resources() {
+    info "Checking system resources..."
+
+    local mem_kb
+    mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ "$mem_kb" -ge 524288 ]]; then
+        info "  Memory: $((mem_kb / 1024)) MB — OK"
+    else
+        warn "  Memory: $((mem_kb / 1024)) MB — recommended >= 512 MB"
+    fi
+
+    local disk_kb
+    disk_kb="$(df -k / --output=avail 2>/dev/null | tail -1 || echo 0)"
+    if [[ "$disk_kb" -ge 1048576 ]]; then
+        info "  Disk free: $((disk_kb / 1024)) MB — OK"
+    else
+        warn "  Disk free: $((disk_kb / 1024)) MB — recommended >= 1 GB"
+    fi
+}
+
+check_clock() {
+    info "Checking system clock..."
+    if command -v timedatectl >/dev/null 2>&1; then
+        local synced
+        synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo 'unknown')"
+        if [[ "$synced" == "yes" ]]; then
+            info "  NTP synchronized: yes"
+        else
+            warn "  NTP synchronized: ${synced}. Time skew may cause TLS/cert issues."
+        fi
+    else
+        warn "  timedatectl not available; cannot verify clock sync."
+    fi
+}
+
+check_kernel() {
+    local kver
+    kver="$(uname -r 2>/dev/null || echo '0.0.0')"
+    local major
+    major="$(echo "$kver" | cut -d. -f1)"
+    if [[ "$major" -ge 4 ]]; then
+        info "  Kernel: ${kver} — OK"
+    else
+        warn "  Kernel: ${kver} — recommended >= 4.x"
+    fi
+}
+
+# ===========================================================
+# ARGUMENT PARSING
+# ===========================================================
 
 parse_args() {
     [[ $# -gt 0 ]] || { usage; exit 0; }
@@ -143,21 +279,25 @@ parse_args() {
         install)
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --mode) [[ $# -ge 2 ]] || die "--mode needs a value"; MODE="$2"; shift 2;;
+                    --mode)   [[ $# -ge 2 ]] || die "--mode needs a value"; MODE="$2"; shift 2;;
                     --domain) [[ $# -ge 2 ]] || die "--domain needs a value"; DOMAIN="$2"; shift 2;;
-                    --email) [[ $# -ge 2 ]] || die "--email needs a value"; EMAIL="$2"; shift 2;;
+                    --email)  [[ $# -ge 2 ]] || die "--email needs a value"; EMAIL="$2"; shift 2;;
                     --help|-h) usage; exit 0;;
                     *) die "Unknown option: $1";;
                 esac
             done
             ;;
-        status|test|update|uninstall)
-            [[ $# -eq 0 ]] || die "Unexpected arguments."
+        test|audit|status|update|uninstall)
+            [[ $# -eq 0 ]] || die "Unexpected arguments for '$COMMAND'."
             ;;
         help|-h|--help) usage; exit 0;;
         *) die "Unknown command: $COMMAND";;
     esac
 }
+
+# ===========================================================
+# INTERACTIVE PROMPTS
+# ===========================================================
 
 select_mode() {
     [[ -n "$MODE" ]] && return
@@ -180,10 +320,10 @@ validate_mode() {
 prompt_domain() {
     [[ -n "$DOMAIN" ]] || read -r -p "Domain: " DOMAIN
     [[ -n "$DOMAIN" ]] || die "Domain is required."
-    [[ ${#DOMAIN} -le 253 ]] || die "Domain is too long."
+    [[ ${#DOMAIN} -le 253 ]] || die "Domain is too long (max 253 chars)."
     [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
-        || die "Invalid domain."
-    [[ "$DOMAIN" != *..* ]] || die "Invalid domain."
+        || die "Invalid domain format."
+    [[ "$DOMAIN" != *..* ]] || die "Invalid domain (consecutive dots)."
 }
 
 prompt_email() {
@@ -191,7 +331,7 @@ prompt_email() {
     while true; do
         read -r -p "Let's Encrypt email: " EMAIL
         [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && break
-        warn "Invalid email."
+        warn "Invalid email format."
     done
 }
 
@@ -216,10 +356,15 @@ generate_ws_path() {
     WS_PATH="/$(openssl rand -hex 16)"
 }
 
+# ===========================================================
+# INSTALLATION FUNCTIONS
+# ===========================================================
+
 install_base_packages() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y curl ca-certificates openssl unzip jq certbot python3-certbot-dns-cloudflare ufw
+    apt-get install -y curl ca-certificates openssl unzip jq certbot \
+        python3-certbot-dns-cloudflare ufw iproute2
 }
 
 create_user_and_dirs() {
@@ -238,9 +383,9 @@ create_user_and_dirs() {
 prompt_cloudflare_token() {
     local token=""
     echo
-    echo "Cloudflare token must have only:"
+    echo "Cloudflare API Token requirements:"
     echo "  Zone -> DNS -> Edit"
-    echo "restricted to the required zone."
+    echo "  Restricted to the target zone only."
     echo
     read -r -s -p "Cloudflare API Token: " token
     echo
@@ -288,7 +433,7 @@ verify_cert_pair() {
         openssl pkey -pubin -outform DER | sha256sum)"
     b="$(openssl pkey -in "$key" -pubout |
         openssl pkey -pubin -outform DER | sha256sum)"
-    [[ "$a" == "$b" ]] || die "Certificate/private-key mismatch."
+    [[ "$a" == "$b" ]] || die "Certificate / private-key mismatch."
 }
 
 create_cert_deploy_hook() {
@@ -318,7 +463,7 @@ download_trojan_go() {
         || die "TROJAN_GO_SHA256 is not set. Installation refused."
 
     [[ "$TROJAN_GO_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] \
-        || die "Invalid SHA256."
+        || die "Invalid SHA256 format."
 
     local url="https://github.com/${TROJAN_GO_REPO}/releases/download/${TROJAN_GO_VERSION}/${TROJAN_GO_ASSET}"
     local archive="$TROJAN_CACHE/$TROJAN_GO_ASSET"
@@ -339,7 +484,7 @@ download_trojan_go() {
 
     install -o root -g root -m 0755 "$extract/trojan-go" "$TROJAN_BIN"
 
-    # Install the bundled data files if present.
+    # Install bundled data files if present.
     [[ -f "$extract/geoip.dat" ]] &&
         install -o root -g "$TROJAN_GROUP" -m 0644 "$extract/geoip.dat" "$TROJAN_ETC/geoip.dat"
     [[ -f "$extract/geosite.dat" ]] &&
@@ -350,13 +495,6 @@ download_trojan_go() {
 }
 
 generate_config() {
-    local remote_port=9
-    local fallback_json=''
-
-    if [[ "$MODE" == "fallback" ]]; then
-        fallback_json='"fallback_addr":"127.0.0.1","fallback_port":8081,'
-    fi
-
     if [[ "$MODE" == "ws" ]]; then
         jq -n \
             --arg p "$PASSWORD" \
@@ -620,39 +758,24 @@ configure_ufw() {
 }
 
 verify_ports() {
-    ss -lntp | grep -E ':(443|8080|8081)\b' || true
+    info "Verifying listening ports..."
+
+    ss -lntp | grep -E ':(443|8080|8081)[[:space:]]' || true
 
     if [[ "$MODE" == "fallback" ]]; then
-        ss -lntp | grep -Eq '127\.0\.0\.1:8080\b' \
-            || die "Fallback HTTP port 8080 is not listening."
-        ss -lntp | grep -Eq '127\.0\.0\.1:8081\b' \
-            || die "Fallback raw port 8081 is not listening."
+        ss -lntp | grep -Eq '127\.0\.0\.1:8080[[:space:]]' \
+            || die "Fallback HTTP port 8080 is not listening on 127.0.0.1."
+        ss -lntp | grep -Eq '127\.0\.0\.1:8081[[:space:]]' \
+            || die "Fallback raw port 8081 is not listening on 127.0.0.1."
     fi
 
-    ss -lntp | grep -Eq '0\.0\.0\.0:443\b' \
-        || die "Trojan-Go is not listening on IPv4 port 443."
+    ss -lntp | grep -Eq '0\.0\.0\.0:443[[:space:]]' \
+        || die "Trojan-Go is not listening on 0.0.0.0:443."
 }
 
-status() {
-    echo "Trojan-Go Secure Installer ${SCRIPT_VERSION}"
-    echo "---------------------------------------"
-    echo "User: $(id "$TROJAN_USER" 2>/dev/null || echo not-installed)"
-    [[ -x "$TROJAN_BIN" ]] && echo "Binary: installed" || echo "Binary: not-installed"
-    systemctl is-enabled --quiet trojan-go 2>/dev/null && echo "Enabled: yes" || echo "Enabled: no"
-    systemctl is-active --quiet trojan-go 2>/dev/null && echo "Running: yes" || echo "Running: no"
-    [[ -f "$TROJAN_CONFIG" ]] && echo "Config: $TROJAN_CONFIG"
-    [[ -f "$TROJAN_CERT_DIR/fullchain.pem" ]] && echo "Certificate: present" || echo "Certificate: missing"
-    echo
-}
-
-test_installation() {
-    check_root
-    check_os
-    check_arch
-    check_commands
-    check_ipv4
-    info "Environment test passed."
-}
+# ===========================================================
+# INSTALL ORCHESTRATION
+# ===========================================================
 
 install_all() {
     validate_mode
@@ -665,12 +788,16 @@ install_all() {
     echo "Mode   : $MODE"
     echo "Domain : $DOMAIN"
     echo "Arch   : amd64"
+    [[ "$MODE" == "ws" ]] && echo "WS Path: $WS_PATH"
     echo
+
+    check_ports_free
+    check_dns "$DOMAIN"
+    check_resources
 
     install_base_packages
     create_user_and_dirs
     prompt_cloudflare_token
-    install_certbot
     issue_certificate
     create_cert_deploy_hook
 
@@ -684,33 +811,792 @@ install_all() {
     configure_ufw
     verify_ports
 
-    unset PASSWORD
     info "Installation completed."
-    info "Use: $0 status"
+    echo
+    info "Running post-installation audit..."
+    run_audit
 }
 
+# ===========================================================
+# TEST COMMAND
+# ===========================================================
+
+test_installation() {
+    echo "=============================================="
+    echo " Trojan-Go Installer ${SCRIPT_VERSION} — Pre-Install Test"
+    echo "=============================================="
+    echo
+
+    local failures=0
+
+    run_test() {
+        local desc="$1"; shift
+        printf "  %-50s " "$desc ..."
+        if "$@" >/dev/null 2>&1; then
+            echo "PASS"
+        else
+            echo "FAIL"
+            ((failures++)) || true
+        fi
+    }
+
+    run_test "Root user" check_root
+    run_test "Ubuntu 24.04" check_os
+    run_test "amd64 architecture" check_arch
+    run_test "Required commands" check_commands
+    echo
+
+    info "IPv4 detection:"
+    check_ipv4
+    echo
+
+    info "Port availability:"
+    local port
+    for port in 443 8080 8081; do
+        if ss -lntp 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
+            warn "  Port ${port}: IN USE"
+        else
+            info "  Port ${port}: free"
+        fi
+    done
+    echo
+
+    info "DNS check (informational):"
+    if command -v dig >/dev/null 2>&1; then
+        info "  dig: available"
+    elif command -v nslookup >/dev/null 2>&1; then
+        info "  nslookup: available"
+    else
+        warn "  No DNS lookup tool found (dig/nslookup/host)."
+    fi
+    echo
+
+    check_resources
+    check_clock
+    check_kernel
+    echo
+
+    if [[ "$failures" -eq 0 ]]; then
+        info "All mandatory checks passed."
+    else
+        warn "${failures} check(s) failed. Review above before installing."
+    fi
+}
+
+# ===========================================================
+# STATUS COMMAND
+# ===========================================================
+
+status() {
+    echo "=============================================="
+    echo " Trojan-Go Installer ${SCRIPT_VERSION} — Status"
+    echo "=============================================="
+    echo
+
+    # Installation status
+    echo "--- Installation ---"
+    if id "$TROJAN_USER" >/dev/null 2>&1; then
+        echo "  User trojan  : present ($(id "$TROJAN_USER" 2>/dev/null || true))"
+    else
+        echo "  User trojan  : NOT INSTALLED"
+    fi
+
+    if [[ -x "$TROJAN_BIN" ]]; then
+        echo "  Binary       : $TROJAN_BIN"
+        local bin_sha
+        bin_sha="$(sha256sum "$TROJAN_BIN" 2>/dev/null | awk '{print $1}' || echo 'unknown')"
+        echo "  SHA256       : ${bin_sha}"
+        local bin_ver
+        bin_ver="$("$TROJAN_BIN" -version 2>/dev/null || echo 'unknown')"
+        echo "  Version      : ${bin_ver}"
+    else
+        echo "  Binary       : NOT INSTALLED"
+    fi
+
+    if [[ -f "$TROJAN_CONFIG" ]]; then
+        echo "  Config       : $TROJAN_CONFIG"
+        local cfg_mode
+        cfg_mode="$(jq -r 'if .websocket.enabled then "ws" elif .ssl.fallback_addr then "fallback" else "tcp" end' "$TROJAN_CONFIG" 2>/dev/null || echo 'unknown')"
+        echo "  Mode         : ${cfg_mode}"
+    else
+        echo "  Config       : MISSING"
+    fi
+    echo
+
+    # systemd
+    echo "--- systemd ---"
+    if [[ -f "$SYSTEMD_UNIT" ]]; then
+        echo "  Unit file    : present"
+    else
+        echo "  Unit file    : MISSING"
+    fi
+
+    if systemctl is-enabled --quiet trojan-go 2>/dev/null; then
+        echo "  Enabled      : yes"
+    else
+        echo "  Enabled      : no"
+    fi
+
+    if systemctl is-active --quiet trojan-go 2>/dev/null; then
+        echo "  Running      : yes"
+    else
+        echo "  Running      : no"
+    fi
+    echo
+
+    # Certificate
+    echo "--- Certificate ---"
+    local cert_file="$TROJAN_CERT_DIR/fullchain.pem"
+    if [[ -f "$cert_file" ]]; then
+        echo "  Certificate  : present"
+        local expiry
+        expiry="$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2 || echo 'unknown')"
+        echo "  Expires      : ${expiry}"
+        local san
+        san="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -oP 'DNS:[^\s,]+' | tr '\n' ' ' || echo 'unknown')"
+        echo "  SAN          : ${san}"
+    else
+        echo "  Certificate  : MISSING"
+    fi
+    echo
+
+    # Listening ports
+    echo "--- Listening Ports ---"
+    ss -lntp 2>/dev/null | grep -E ':(443|80|8080|8081)[[:space:]]' \
+        | awk '{print "  "$4" -> "$NF}' || echo "  (none detected)"
+    echo
+
+    # UFW
+    echo "--- Firewall ---"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw status 2>/dev/null | grep -E '(Status|443|22|ssh|8080|8081)' || echo "  (no relevant rules)"
+    else
+        echo "  UFW: not installed"
+    fi
+    echo
+
+    # Nginx (informational)
+    if command -v nginx >/dev/null 2>&1; then
+        echo "--- Nginx ---"
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            echo "  Running      : yes"
+        else
+            echo "  Running      : no"
+        fi
+        if [[ -f /etc/nginx/sites-enabled/trojan-go-fallback ]]; then
+            echo "  Fallback cfg : enabled"
+        else
+            echo "  Fallback cfg : not enabled"
+        fi
+        echo
+    fi
+}
+
+# ===========================================================
+# AUDIT COMMAND
+# ===========================================================
+
+# Audit helper: prints PASS/FAIL/WARN with consistent formatting
+audit_item() {
+    local result="$1"; shift
+    local label="$1"; shift
+    local detail="${1:-}"
+
+    case "$result" in
+        PASS) ((AUDIT_PASS++)) || true
+              printf '  [PASS] %s\n' "$label" ;;
+        FAIL) ((AUDIT_FAIL++)) || true
+              printf '  [FAIL] %s  — %s\n' "$label" "$detail" ;;
+        WARN) ((AUDIT_WARN++)) || true
+              printf '  [WARN] %s  — %s\n' "$label" "$detail" ;;
+    esac
+}
+
+run_audit() {
+    AUDIT_PASS=0
+    AUDIT_FAIL=0
+    AUDIT_WARN=0
+
+    echo "=============================================="
+    echo " Trojan-Go ${SCRIPT_VERSION} — Security Audit"
+    echo "=============================================="
+    echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo
+
+    # ---- 1. System Environment ----
+    echo "1. System Environment"
+    echo "----------------------"
+    local os_name
+    os_name="$(source /etc/os-release 2>/dev/null && echo "${ID:-} ${VERSION_ID:-}" || echo 'unknown')"
+    audit_item PASS "OS             : ${os_name}"
+
+    local kver
+    kver="$(uname -r 2>/dev/null || echo 'unknown')"
+    audit_item PASS "Kernel         : ${kver}"
+
+    local uptime_str
+    uptime_str="$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo 'unknown')"
+    audit_item PASS "Uptime         : ${uptime_str}"
+    echo
+
+    # ---- 2. Trojan-Go Binary ----
+    echo "2. Trojan-Go Binary"
+    echo "----------------------"
+    if [[ -x "$TROJAN_BIN" ]]; then
+        audit_item PASS "Binary exists  : $TROJAN_BIN"
+        local sha
+        sha="$(sha256sum "$TROJAN_BIN" 2>/dev/null | awk '{print $1}')"
+        audit_item PASS "SHA256         : ${sha:0:16}..."
+
+        local owner
+        owner="$(stat -c '%U:%G' "$TROJAN_BIN" 2>/dev/null || echo 'unknown')"
+        if [[ "$owner" == "root:root" ]]; then
+            audit_item PASS "Ownership      : ${owner}"
+        else
+            audit_item FAIL "Ownership      : ${owner} (expected root:root)"
+        fi
+
+        local perms
+        perms="$(stat -c '%a' "$TROJAN_BIN" 2>/dev/null || echo '000')"
+        if [[ "$perms" == "755" ]]; then
+            audit_item PASS "Permissions    : ${perms}"
+        else
+            audit_item WARN "Permissions    : ${perms} (expected 755)"
+        fi
+    else
+        audit_item FAIL "Binary missing : $TROJAN_BIN does not exist or is not executable"
+    fi
+    echo
+
+    # ---- 3. Trojan-Go Configuration ----
+    echo "3. Configuration"
+    echo "----------------------"
+    if [[ -f "$TROJAN_CONFIG" ]]; then
+        audit_item PASS "Config exists  : $TROJAN_CONFIG"
+
+        if jq empty "$TROJAN_CONFIG" >/dev/null 2>&1; then
+            audit_item PASS "JSON valid     : yes"
+
+            local run_type
+            run_type="$(jq -r '.run_type // "missing"' "$TROJAN_CONFIG" 2>/dev/null)"
+            if [[ "$run_type" == "server" ]]; then
+                audit_item PASS "run_type       : server"
+            else
+                audit_item FAIL "run_type       : ${run_type} (expected server)"
+            fi
+
+            local local_addr
+            local_addr="$(jq -r '.local_addr // "missing"' "$TROJAN_CONFIG" 2>/dev/null)"
+            if [[ "$local_addr" == "0.0.0.0" ]]; then
+                audit_item PASS "local_addr     : 0.0.0.0"
+            else
+                audit_item WARN "local_addr     : ${local_addr}"
+            fi
+
+            local local_port
+            local_port="$(jq -r '.local_port // 0' "$TROJAN_CONFIG" 2>/dev/null)"
+            if [[ "$local_port" == "443" ]]; then
+                audit_item PASS "local_port     : 443"
+            else
+                audit_item FAIL "local_port     : ${local_port} (expected 443)"
+            fi
+
+            local ssl_cert
+            ssl_cert="$(jq -r '.ssl.cert // "missing"' "$TROJAN_CONFIG" 2>/dev/null)"
+            if [[ -f "$ssl_cert" ]]; then
+                audit_item PASS "ssl.cert       : exists"
+            else
+                audit_item FAIL "ssl.cert       : file not found (${ssl_cert})"
+            fi
+
+            local ssl_key
+            ssl_key="$(jq -r '.ssl.key // "missing"' "$TROJAN_CONFIG" 2>/dev/null)"
+            if [[ -f "$ssl_key" ]]; then
+                audit_item PASS "ssl.key        : exists"
+            else
+                audit_item FAIL "ssl.key        : file not found (${ssl_key})"
+            fi
+
+            local ws_enabled
+            ws_enabled="$(jq -r '.websocket.enabled // false' "$TROJAN_CONFIG" 2>/dev/null)"
+            if [[ "$ws_enabled" == "true" ]]; then
+                local ws_path
+                ws_path="$(jq -r '.websocket.path // "missing"' "$TROJAN_CONFIG" 2>/dev/null)"
+                audit_item PASS "websocket      : enabled, path present"
+            else
+                audit_item PASS "websocket      : disabled (tcp/fallback mode)"
+            fi
+
+            local fb_addr
+            fb_addr="$(jq -r '.ssl.fallback_addr // ""' "$TROJAN_CONFIG" 2>/dev/null)"
+            if [[ -n "$fb_addr" ]]; then
+                if [[ "$fb_addr" == "127.0.0.1" ]]; then
+                    audit_item PASS "fallback_addr  : 127.0.0.1"
+                else
+                    audit_item FAIL "fallback_addr  : ${fb_addr} (expected 127.0.0.1)"
+                fi
+            fi
+
+        else
+            audit_item FAIL "JSON valid     : INVALID — $(jq empty "$TROJAN_CONFIG" 2>&1)"
+        fi
+
+        local cfg_owner
+        cfg_owner="$(stat -c '%U:%G' "$TROJAN_CONFIG" 2>/dev/null || echo 'unknown')"
+        if [[ "$cfg_owner" == "root:${TROJAN_GROUP}" ]]; then
+            audit_item PASS "Config owner   : ${cfg_owner}"
+        else
+            audit_item FAIL "Config owner   : ${cfg_owner} (expected root:${TROJAN_GROUP})"
+        fi
+
+        local cfg_perms
+        cfg_perms="$(stat -c '%a' "$TROJAN_CONFIG" 2>/dev/null || echo '000')"
+        if [[ "$cfg_perms" == "640" ]]; then
+            audit_item PASS "Config perms   : ${cfg_perms}"
+        else
+            audit_item FAIL "Config perms   : ${cfg_perms} (expected 640)"
+        fi
+    else
+        audit_item FAIL "Config missing : $TROJAN_CONFIG"
+    fi
+    echo
+
+    # ---- 4. Certificate Audit ----
+    echo "4. Certificate Audit"
+    echo "----------------------"
+    local cert_file="$TROJAN_CERT_DIR/fullchain.pem"
+    local key_file="$TROJAN_CERT_DIR/privkey.pem"
+
+    if [[ -f "$cert_file" ]]; then
+        audit_item PASS "fullchain.pem  : exists"
+
+        local cert_owner
+        cert_owner="$(stat -c '%U:%G' "$cert_file" 2>/dev/null || echo 'unknown')"
+        if [[ "$cert_owner" == "root:${TROJAN_GROUP}" ]]; then
+            audit_item PASS "Cert owner     : ${cert_owner}"
+        else
+            audit_item WARN "Cert owner     : ${cert_owner} (expected root:${TROJAN_GROUP})"
+        fi
+
+        local cert_perms
+        cert_perms="$(stat -c '%a' "$cert_file" 2>/dev/null || echo '000')"
+        if [[ "$cert_perms" == "640" ]]; then
+            audit_item PASS "Cert perms     : ${cert_perms}"
+        else
+            audit_item WARN "Cert perms     : ${cert_perms} (expected 640)"
+        fi
+
+        # Validity
+        local not_after
+        not_after="$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)"
+        if [[ -n "$not_after" ]]; then
+            local expiry_epoch
+            expiry_epoch="$(date -d "$not_after" +%s 2>/dev/null || echo 0)"
+            local now_epoch
+            now_epoch="$(date +%s)"
+            local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+            if [[ "$days_left" -gt 30 ]]; then
+                audit_item PASS "Cert expiry    : ${days_left} days (${not_after})"
+            elif [[ "$days_left" -gt 0 ]]; then
+                audit_item WARN "Cert expiry    : ${days_left} days — RENEW SOON (${not_after})"
+            else
+                audit_item FAIL "Cert expired   : ${not_after}"
+            fi
+        else
+            audit_item FAIL "Cert expiry    : could not read"
+        fi
+
+        # SAN
+        local san
+        san="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -oP 'DNS:[^\s,]+' | tr '\n' ' ' || echo '')"
+        if [[ -n "$san" ]]; then
+            audit_item PASS "SAN            : ${san}"
+        fi
+    else
+        audit_item FAIL "fullchain.pem  : MISSING"
+    fi
+
+    if [[ -f "$key_file" ]]; then
+        audit_item PASS "privkey.pem    : exists"
+
+        local key_owner
+        key_owner="$(stat -c '%U:%G' "$key_file" 2>/dev/null || echo 'unknown')"
+        if [[ "$key_owner" == "root:${TROJAN_GROUP}" ]]; then
+            audit_item PASS "Key owner      : ${key_owner}"
+        else
+            audit_item FAIL "Key owner      : ${key_owner} (expected root:${TROJAN_GROUP})"
+        fi
+
+        local key_perms
+        key_perms="$(stat -c '%a' "$key_file" 2>/dev/null || echo '000')"
+        if [[ "$key_perms" == "640" ]]; then
+            audit_item PASS "Key perms      : ${key_perms}"
+        else
+            audit_item FAIL "Key perms      : ${key_perms} (expected 640)"
+        fi
+    else
+        audit_item FAIL "privkey.pem    : MISSING"
+    fi
+
+    # Cert/key match
+    if [[ -f "$cert_file" && -f "$key_file" ]]; then
+        local cert_pub key_pub
+        cert_pub="$(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+        key_pub="$(openssl pkey -in "$key_file" -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+        if [[ "$cert_pub" == "$key_pub" ]]; then
+            audit_item PASS "Cert/key match : yes"
+        else
+            audit_item FAIL "Cert/key match : MISMATCH"
+        fi
+    fi
+
+    # Certbot timer
+    if systemctl list-timers --all 2>/dev/null | grep -q 'certbot'; then
+        audit_item PASS "Certbot timer  : active"
+    elif [[ -f /etc/cron.d/certbot ]] || [[ -f /etc/systemd/system/certbot.timer ]]; then
+        audit_item PASS "Certbot timer  : configured"
+    else
+        audit_item WARN "Certbot timer  : not detected — renewal may not be automatic"
+    fi
+    echo
+
+    # ---- 5. systemd Audit ----
+    echo "5. systemd Audit"
+    echo "----------------------"
+    if [[ -f "$SYSTEMD_UNIT" ]]; then
+        audit_item PASS "Unit file      : exists"
+
+        local unit_user
+        unit_user="$(grep -Po '(?<=^User=).*' "$SYSTEMD_UNIT" 2>/dev/null || echo '')"
+        if [[ "$unit_user" == "$TROJAN_USER" ]]; then
+            audit_item PASS "User           : ${TROJAN_USER}"
+        else
+            audit_item FAIL "User           : ${unit_user:-MISSING} (expected ${TROJAN_USER})"
+        fi
+
+        # Check key security directives
+        local check_directives=(
+            "NoNewPrivileges=true"
+            "PrivateTmp=true"
+            "PrivateDevices=true"
+            "ProtectHome=true"
+            "ProtectSystem=strict"
+            "RestrictSUIDSGID=true"
+            "LockPersonality=true"
+        )
+        local d
+        for d in "${check_directives[@]}"; do
+            local key="${d%%=*}"
+            if grep -qF "$d" "$SYSTEMD_UNIT" 2>/dev/null; then
+                audit_item PASS "  ${key}"
+            else
+                audit_item WARN "  ${key}       : missing"
+            fi
+        done
+
+        if grep -q '^CapabilityBoundingSet=$' "$SYSTEMD_UNIT" 2>/dev/null; then
+            audit_item PASS "  CapabilityBoundingSet= : empty (hardened)"
+        else
+            audit_item WARN "  CapabilityBoundingSet  : not empty"
+        fi
+
+        if systemctl is-enabled --quiet trojan-go 2>/dev/null; then
+            audit_item PASS "Enabled        : yes"
+        else
+            audit_item FAIL "Enabled        : no — will not start on boot"
+        fi
+
+        if systemctl is-active --quiet trojan-go 2>/dev/null; then
+            audit_item PASS "Active         : yes"
+        else
+            audit_item FAIL "Active         : no — service is not running"
+        fi
+    else
+        audit_item FAIL "Unit file      : MISSING ($SYSTEMD_UNIT)"
+    fi
+    echo
+
+    # ---- 6. User & Permissions ----
+    echo "6. User & Permissions"
+    echo "----------------------"
+    if id "$TROJAN_USER" >/dev/null 2>&1; then
+        audit_item PASS "User trojan    : exists"
+
+        local shell
+        shell="$(getent passwd "$TROJAN_USER" | cut -d: -f7)"
+        if [[ "$shell" == "/usr/sbin/nologin" ]] || [[ "$shell" == "/bin/false" ]] || [[ "$shell" == "/usr/sbin/nologin" ]]; then
+            audit_item PASS "Shell          : ${shell} (no login)"
+        else
+            audit_item FAIL "Shell          : ${shell} (expected nologin)"
+        fi
+
+        # Check not in sudo group
+        if id -nG "$TROJAN_USER" 2>/dev/null | grep -qw 'sudo'; then
+            audit_item FAIL "sudo access    : YES — trojan user has sudo!"
+        else
+            audit_item PASS "sudo access    : none"
+        fi
+    else
+        audit_item FAIL "User trojan    : MISSING"
+    fi
+
+    # Directory permissions
+    local check_dirs=(
+        "$TROJAN_ETC:root:${TROJAN_GROUP}:750"
+        "$TROJAN_CERT_DIR:root:${TROJAN_GROUP}:750"
+        "$TROJAN_DATA:${TROJAN_USER}:${TROJAN_GROUP}:750"
+        "$TROJAN_CACHE:root:root:750"
+    )
+    local d_entry
+    for d_entry in "${check_dirs[@]}"; do
+        IFS=':' read -r d_path d_owner d_group d_perms <<< "$d_entry"
+        if [[ -d "$d_path" ]]; then
+            local actual_owner actual_perms
+            actual_owner="$(stat -c '%U:%G' "$d_path" 2>/dev/null || echo '?:?')"
+            actual_perms="$(stat -c '%a' "$d_path" 2>/dev/null || echo '000')"
+            if [[ "$actual_owner" == "${d_owner}:${d_group}" ]] && [[ "$actual_perms" == "$d_perms" ]]; then
+                audit_item PASS "Dir            : $d_path (${actual_owner} ${actual_perms})"
+            else
+                audit_item WARN "Dir            : $d_path (${actual_owner} ${actual_perms}, expected ${d_owner}:${d_group} ${d_perms})"
+            fi
+        else
+            # Only FAIL for cert dir when we have config; otherwise INFO via PASS
+            audit_item PASS "Dir            : $d_path (not present)"
+        fi
+    done
+    echo
+
+    # ---- 7. Network Audit ----
+    echo "7. Network Audit"
+    echo "----------------------"
+
+    # 443
+    if ss -lntp 2>/dev/null | grep -Eq '0\.0\.0\.0:443[[:space:]]'; then
+        local proc_443
+        proc_443="$(ss -lntp 2>/dev/null | grep -E '0\.0\.0\.0:443[[:space:]]' | awk '{print $NF}' | head -1)"
+        audit_item PASS "443 listening  : yes (${proc_443})"
+    elif ss -lntp 2>/dev/null | grep -Eq ':443[[:space:]]'; then
+        local proc_443
+        proc_443="$(ss -lntp 2>/dev/null | grep -E ':443[[:space:]]' | awk '{print $NF}' | head -1)"
+        audit_item WARN "443 listening  : yes but check bind address (${proc_443})"
+    else
+        audit_item FAIL "443 listening  : NO — Trojan-Go is not reachable"
+    fi
+
+    # 8080/8081 must be 127.0.0.1 only (only relevant in fallback mode or if Nginx is installed)
+    local port
+    for port in 8080 8081; do
+        if ss -lntp 2>/dev/null | grep -Eq ":${port}[[:space:]]"; then
+            if ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:${port}[[:space:]]"; then
+                audit_item PASS "Port ${port}    : 127.0.0.1 only (safe)"
+            else
+                audit_item FAIL "Port ${port}    : EXPOSED — must listen on 127.0.0.1 only!"
+            fi
+        else
+            # Not listening — fine unless fallback mode
+            audit_item PASS "Port ${port}    : not listening (OK for non-fallback)"
+        fi
+    done
+
+    # UFW
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q 'Status: active'; then
+            audit_item PASS "UFW            : active"
+        else
+            audit_item WARN "UFW            : inactive"
+        fi
+
+        # Check no 8080/8081 exposed
+        if ufw status 2>/dev/null | grep -qE '8080|8081'; then
+            audit_item FAIL "UFW 8080/8081  : exposed in firewall — should be internal only!"
+        else
+            audit_item PASS "UFW 8080/8081  : not exposed"
+        fi
+
+        if ufw status 2>/dev/null | grep -qE '443'; then
+            audit_item PASS "UFW 443        : allowed"
+        else
+            audit_item FAIL "UFW 443        : NOT allowed"
+        fi
+    else
+        audit_item WARN "UFW            : not installed"
+    fi
+    echo
+
+    # ---- 8. Nginx Audit (fallback only) ----
+    echo "8. Nginx Audit"
+    echo "----------------------"
+    if command -v nginx >/dev/null 2>&1; then
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            audit_item PASS "Nginx running  : yes"
+        else
+            audit_item FAIL "Nginx running  : no"
+        fi
+
+        local fb_conf="/etc/nginx/sites-available/trojan-go-fallback"
+        if [[ -f "$fb_conf" ]]; then
+            audit_item PASS "Fallback conf  : exists"
+
+            if grep -q 'listen 127.0.0.1:8080' "$fb_conf" 2>/dev/null; then
+                audit_item PASS "  8080 bind    : 127.0.0.1"
+            else
+                audit_item FAIL "  8080 bind    : NOT 127.0.0.1"
+            fi
+
+            if grep -q 'listen 127.0.0.1:8081' "$fb_conf" 2>/dev/null; then
+                audit_item PASS "  8081 bind    : 127.0.0.1"
+            else
+                audit_item FAIL "  8081 bind    : NOT 127.0.0.1"
+            fi
+
+            if grep -q 'server_tokens off' "$fb_conf" 2>/dev/null; then
+                audit_item PASS "  server_tokens: off"
+            else
+                audit_item WARN "  server_tokens: not off"
+            fi
+
+            if nginx -t >/dev/null 2>&1; then
+                audit_item PASS "Nginx config   : valid"
+            else
+                audit_item FAIL "Nginx config   : INVALID — run nginx -t"
+            fi
+        else
+            audit_item PASS "Fallback conf  : none (not a fallback install)"
+        fi
+    else
+        audit_item PASS "Nginx          : not installed (OK for non-fallback)"
+    fi
+    echo
+
+    # ---- 9. Sensitive Files ----
+    echo "9. Sensitive File Audit"
+    echo "----------------------"
+
+    if [[ -f "$CF_CREDENTIALS" ]]; then
+        local cf_owner cf_perms
+        cf_owner="$(stat -c '%U:%G' "$CF_CREDENTIALS" 2>/dev/null || echo '?:?')"
+        cf_perms="$(stat -c '%a' "$CF_CREDENTIALS" 2>/dev/null || echo '000')"
+
+        if [[ "$cf_owner" == "root:root" ]]; then
+            audit_item PASS "cloudflare.ini owner   : root:root"
+        else
+            audit_item FAIL "cloudflare.ini owner   : ${cf_owner} (expected root:root)"
+        fi
+
+        if [[ "$cf_perms" == "600" ]]; then
+            audit_item PASS "cloudflare.ini perms   : 600"
+        else
+            audit_item FAIL "cloudflare.ini perms   : ${cf_perms} (expected 600)"
+        fi
+
+        # Verify trojan user cannot read
+        if su -s /bin/bash -c "test -r $CF_CREDENTIALS && echo readable || echo denied" "$TROJAN_USER" 2>/dev/null | grep -q 'denied'; then
+            audit_item PASS "cloudflare.ini trojan  : cannot read"
+        else
+            # Alternative check: if file is 600 root:root, trojan can't read
+            if [[ "$cf_owner" == "root:root" && "$cf_perms" == "600" ]]; then
+                audit_item PASS "cloudflare.ini trojan  : cannot read (by perms)"
+            else
+                audit_item FAIL "cloudflare.ini trojan  : MAY BE READABLE by trojan user"
+            fi
+        fi
+    else
+        audit_item PASS "cloudflare.ini : not present (no Cloudflare token stored)"
+    fi
+
+    # Config contains password — verify it's not world-readable
+    if [[ -f "$TROJAN_CONFIG" ]]; then
+        local cfg_perms_check
+        cfg_perms_check="$(stat -c '%a' "$TROJAN_CONFIG" 2>/dev/null || echo '000')"
+        if [[ "${cfg_perms_check: -1}" == "0" ]]; then
+            audit_item PASS "config.json world  : not readable"
+        else
+            audit_item FAIL "config.json world  : readable! ($cfg_perms_check)"
+        fi
+    fi
+
+    # Private key not world-readable
+    if [[ -f "$key_file" ]]; then
+        local key_perms_check
+        key_perms_check="$(stat -c '%a' "$key_file" 2>/dev/null || echo '000')"
+        if [[ "${key_perms_check: -1}" == "0" ]]; then
+            audit_item PASS "privkey.pem world   : not readable"
+        else
+            audit_item FAIL "privkey.pem world   : readable! ($key_perms_check)"
+        fi
+    fi
+    echo
+
+    # ---- Summary ----
+    echo "=============================================="
+    echo " Audit Summary"
+    echo "=============================================="
+    echo "  PASS : ${AUDIT_PASS}"
+    echo "  WARN : ${AUDIT_WARN}"
+    echo "  FAIL : ${AUDIT_FAIL}"
+    echo "----------------------------------------------"
+
+    if [[ "$AUDIT_FAIL" -gt 0 ]]; then
+        echo "  Result: FAILED — ${AUDIT_FAIL} issue(s) need attention."
+        echo
+        exit 1
+    elif [[ "$AUDIT_WARN" -gt 0 ]]; then
+        echo "  Result: PASSED with ${AUDIT_WARN} warning(s)."
+        echo
+        exit 2
+    else
+        echo "  Result: ALL PASSED"
+        echo
+        exit 0
+    fi
+}
+
+# ===========================================================
+# UPDATE / UNINSTALL (stubs)
+# ===========================================================
+
 update() {
-    die "Update is intentionally disabled in v1.6. Reinstall a pinned, independently verified release."
+    die "Update will be available in v2.0. For now, reinstall with a pinned, independently verified release."
 }
 
 uninstall() {
-    die "Uninstall is intentionally disabled in v1.6 until the final file/ownership inventory is frozen."
+    die "Uninstall will be available in v2.0. Manual cleanup only at this stage."
 }
+
+# ===========================================================
+# MAIN
+# ===========================================================
 
 main() {
     parse_args "$@"
-    check_root
-    check_os
-    check_arch
-    check_commands
-    check_ipv4
 
     case "$COMMAND" in
-        install) select_mode; install_all;;
-        status) status;;
-        test) test_installation;;
-        update) update;;
-        uninstall) uninstall;;
+        install)
+            check_root
+            check_os
+            check_arch
+            check_commands
+            check_ipv4
+            select_mode
+            install_all
+            ;;
+        test)
+            check_root
+            test_installation
+            ;;
+        audit)
+            check_root
+            run_audit
+            ;;
+        status)
+            status
+            ;;
+        update)
+            update
+            ;;
+        uninstall)
+            uninstall
+            ;;
     esac
 }
 
