@@ -56,7 +56,7 @@ readonly TROJAN_GO_ASSET="trojan-go-linux-amd64.zip"
 # environment to override (e.g. when a different binary is verified).
 # Example:
 #   TROJAN_GO_SHA256='...' ./U24amd.sh install --mode tcp
-readonly TROJAN_GO_SHA256_DEFAULT=""
+readonly TROJAN_GO_SHA256_DEFAULT="764480722783a6d76ed8401f6d2f1d87d8df7e60bf261f69c67eb94b77e732af"
 TROJAN_GO_SHA256="${TROJAN_GO_SHA256:-${TROJAN_GO_SHA256_DEFAULT}}"
 
 readonly TROJAN_USER="trojan"
