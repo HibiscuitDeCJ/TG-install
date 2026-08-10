@@ -686,8 +686,8 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 ReadWritePaths=${TROJAN_DATA}
@@ -1301,10 +1301,12 @@ run_audit() {
             fi
         done
 
-        if grep -q '^CapabilityBoundingSet=$' "$SYSTEMD_UNIT" 2>/dev/null; then
-            audit_item PASS "  CapabilityBoundingSet= : empty (hardened)"
+        if grep -q '^CapabilityBoundingSet=CAP_NET_BIND_SERVICE$' "$SYSTEMD_UNIT" 2>/dev/null; then
+            audit_item PASS "  CapabilityBoundingSet : CAP_NET_BIND_SERVICE"
+        elif grep -q '^CapabilityBoundingSet=$' "$SYSTEMD_UNIT" 2>/dev/null; then
+            audit_item FAIL "  CapabilityBoundingSet : empty — cannot bind port 443"
         else
-            audit_item WARN "  CapabilityBoundingSet  : not empty"
+            audit_item WARN "  CapabilityBoundingSet : unexpected value"
         fi
 
         if systemctl is-enabled --quiet trojan-go 2>/dev/null; then
