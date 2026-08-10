@@ -48,7 +48,7 @@ umask 027
 readonly SCRIPT_VERSION="1.9.0"
 readonly TROJAN_GO_VERSION="v0.10.6"
 readonly TROJAN_GO_REPO="HibiscuitDeCJ/TG-install"
-readonly TROJAN_GO_ASSET="trojan-go-linux-amd64.zip"
+readonly TROJAN_GO_ASSET="trojan-go.zip"
 
 # Default SHA256 of the verified binary hosted on this repo's Releases.
 # The value below has been independently verified against the upstream
